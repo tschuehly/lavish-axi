@@ -179,6 +179,7 @@ async function createChromeHarness({
         return true;
       },
     },
+    TextEncoder,
     sessionStorage: {
       getItem(key) {
         return storage.has(key) ? storage.get(key) : null;
@@ -865,4 +866,169 @@ test("chrome client ignores annotation mode toggles after the session ends", asy
 
   assert.equal(chrome.element("annotation")["aria-pressed"], "false");
   assert.equal(chrome.postedToFrame.length, afterEndPostCount);
+});
+
+test("chrome client persists artifact state with a debounced last-write-wins server POST", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, method: init?.method, body: init?.body ? JSON.parse(init.body) : undefined });
+      return { ok: true };
+    },
+  });
+
+  chrome.sendFrameMessage({ type: "lavish:setState", state: { count: 1 } });
+  chrome.sendFrameMessage({ type: "lavish:setState", state: { count: 2 } });
+
+  // Debounced: nothing is written until the timer fires.
+  assert.equal(posts.length, 0);
+
+  chrome.runTimers(250);
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/abc/state");
+  assert.equal(posts[0].method, "POST");
+  assert.deepEqual(posts[0].body, { count: 2 });
+});
+
+test("chrome client answers getState from the unflushed pending write during the debounce window", async () => {
+  let fetched = false;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      if (init?.method === "POST") return { ok: true };
+      fetched = true;
+      return { ok: true, json: async () => ({ count: 0 }) };
+    },
+  });
+
+  chrome.sendFrameMessage({ type: "lavish:setState", state: { count: 9 } });
+  chrome.sendFrameMessage({ type: "lavish:getState", id: "req-pending" });
+  await flushPromises();
+
+  const reply = chrome.postedToFrame.find((message) => message.type === "lavish:state");
+  assert.deepEqual(JSON.parse(JSON.stringify(reply)), { type: "lavish:state", id: "req-pending", state: { count: 9 } });
+  assert.equal(fetched, false);
+});
+
+test("chrome client answers getState from the server and posts it to the iframe", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ count: 7 }) }),
+  });
+
+  chrome.sendFrameMessage({ type: "lavish:getState", id: "req-1" });
+  await flushPromises();
+
+  // The chrome client runs in a separate vm realm, so JSON-clone before structural comparison.
+  const reply = chrome.postedToFrame.find((message) => message.type === "lavish:state");
+  assert.deepEqual(JSON.parse(JSON.stringify(reply)), { type: "lavish:state", id: "req-1", state: { count: 7 } });
+});
+
+test("chrome client resolves getState to null when the server has no state or errors", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: false }),
+  });
+
+  chrome.sendFrameMessage({ type: "lavish:getState", id: "req-2" });
+  await flushPromises();
+
+  const reply = chrome.postedToFrame.find((message) => message.type === "lavish:state");
+  assert.deepEqual(JSON.parse(JSON.stringify(reply)), { type: "lavish:state", id: "req-2", state: null });
+});
+
+test("chrome client skips state writes above the server's 1 MiB cap", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, method: init?.method });
+      return { ok: true };
+    },
+  });
+
+  chrome.sendFrameMessage({ type: "lavish:setState", state: { blob: "x".repeat(1024 * 1024 + 64) } });
+  chrome.runTimers(250);
+  await flushPromises();
+  assert.equal(posts.length, 0);
+
+  // The skipped write must not wedge subsequent, normal-sized writes.
+  chrome.sendFrameMessage({ type: "lavish:setState", state: { step: 1 } });
+  chrome.runTimers(250);
+  await flushPromises();
+  assert.deepEqual(
+    posts.map((post) => post.method),
+    ["POST"],
+  );
+});
+
+test("chrome client serializes state writes so an older POST cannot land after a newer one", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      const entry = { body: init?.body, release: () => {} };
+      posts.push(entry);
+      await new Promise((resolve) => {
+        entry.release = () => resolve(undefined);
+      });
+      return { ok: true };
+    },
+  });
+
+  chrome.sendFrameMessage({ type: "lavish:setState", state: { seq: 1 } });
+  chrome.runTimers(250);
+  await flushPromises();
+  assert.equal(posts.length, 1);
+
+  chrome.sendFrameMessage({ type: "lavish:setState", state: { seq: 2 } });
+  chrome.runTimers(250);
+  await flushPromises();
+  assert.equal(posts.length, 1, "second write must wait for the first POST to settle");
+
+  posts[0].release();
+  await flushPromises();
+  await flushPromises();
+  assert.equal(posts.length, 2);
+  assert.deepEqual(JSON.parse(posts[1].body), { seq: 2 });
+  posts[1].release();
+});
+
+test("chrome client answers getState only after an in-flight state write settles", async () => {
+  const requests = [];
+  let releaseWrite = () => {};
+  const writeGate = new Promise((resolve) => {
+    releaseWrite = () => resolve(undefined);
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      const method = init?.method || "GET";
+      requests.push(method);
+      if (method === "POST") {
+        await writeGate;
+        return { ok: true };
+      }
+      return { ok: true, json: async () => ({ step: "written" }) };
+    },
+  });
+
+  chrome.sendFrameMessage({ type: "lavish:setState", state: { step: "written" } });
+  chrome.runTimers(250);
+  await flushPromises();
+
+  chrome.sendFrameMessage({ type: "lavish:getState", id: "req-3" });
+  await flushPromises();
+
+  // The read must not race the in-flight write, or it would return the previous server value.
+  assert.deepEqual(requests, ["POST"]);
+
+  releaseWrite();
+  await flushPromises();
+  await flushPromises();
+  await flushPromises();
+
+  assert.deepEqual(requests, ["POST", "GET"]);
+  const reply = chrome.postedToFrame.find((message) => message.type === "lavish:state");
+  assert.deepEqual(JSON.parse(JSON.stringify(reply)), {
+    type: "lavish:state",
+    id: "req-3",
+    state: { step: "written" },
+  });
 });

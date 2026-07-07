@@ -486,6 +486,74 @@ async function submitLayoutWarnings(layoutWarnings) {
   if (!response.ok) throw new Error("failed to submit layout warnings");
 }
 
+// Relay artifact state to the per-session server store. The sandboxed iframe can't use
+// localStorage, so it posts setState/getState here; we persist over fetch so state survives
+// reloads. Writes are debounced and last-write-wins; reads resolve null when unavailable.
+let pendingState;
+let hasPendingState = false;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let stateWriteTimer;
+// Reads await the last flushed POST so a getState racing an in-flight write cannot
+// return the previous server value after the artifact already saw the newer one.
+let stateWriteSettled = Promise.resolve();
+
+function scheduleStateWrite(state) {
+  pendingState = state;
+  hasPendingState = true;
+  if (stateWriteTimer) return;
+  stateWriteTimer = setTimeout(flushStateWrite, 250);
+  stateWriteTimer?.unref?.();
+}
+
+function flushStateWrite() {
+  stateWriteTimer = undefined;
+  if (!hasPendingState) return;
+  const state = pendingState;
+  hasPendingState = false;
+  pendingState = undefined;
+  // postMessage structured-clones values JSON can't represent (e.g. BigInt); dropping the
+  // write beats throwing in the timer callback or clobbering persisted state with null.
+  let body;
+  try {
+    body = JSON.stringify(state ?? null);
+  } catch {
+    console.warn("[lavish] artifact state is not JSON-serializable (e.g. cyclic or BigInt); write skipped");
+    return;
+  }
+  // Mirrors the server's ARTIFACT_STATE_MAX_BYTES cap (1 MiB): an oversized payload would
+  // only earn a 413, so skip the POST instead of re-sending it on every debounce flush.
+  if (new TextEncoder().encode(body).length > 1024 * 1024) {
+    console.warn("[lavish] artifact state exceeds 1 MiB; write skipped");
+    return;
+  }
+  // Chain on the previous write: overlapping POSTs can complete out of order, letting an
+  // older payload overwrite a newer one and break last-write-wins.
+  stateWriteSettled = stateWriteSettled
+    .then(() =>
+      fetch("/api/" + key + "/state", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      }),
+    )
+    .then(
+      () => undefined,
+      () => undefined,
+    );
+}
+
+function respondWithState(id) {
+  if (hasPendingState) {
+    postToFrame({ type: "lavish:state", id, state: pendingState ?? null });
+    return;
+  }
+  stateWriteSettled
+    .then(() => fetch("/api/" + key + "/state"))
+    .then((response) => (response.ok ? response.json() : null))
+    .catch(() => null)
+    .then((state) => postToFrame({ type: "lavish:state", id, state: state ?? null }));
+}
+
 async function endSession() {
   if (ended) return;
   const response = await fetch("/api/" + key + "/end", { method: "POST" });
@@ -705,6 +773,8 @@ window.addEventListener("message", (event) => {
     handleLayoutWarningsForGate(msg.layout_warnings);
     submitLayoutWarnings(msg.layout_warnings).catch(() => {});
   }
+  if (msg.type === "lavish:setState") scheduleStateWrite(msg.state);
+  if (msg.type === "lavish:getState") respondWithState(msg.id);
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
   if (msg.type === "lavish:endSession") endSession();
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();

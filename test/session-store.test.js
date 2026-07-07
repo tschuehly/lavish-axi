@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -585,6 +585,90 @@ test("freeform user prompts are stored in session chat history", async () => {
       updated.chat.map((item) => [item.role, item.text]),
       [["user", "Please make this clearer"]],
     );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact state persists, defaults to null, and survives reopening the session", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+
+    assert.equal(await store.getArtifactState(session.key), null);
+
+    await store.setArtifactState(session.key, { items: [1, 2, 3] });
+    assert.deepEqual(await store.getArtifactState(session.key), { items: [1, 2, 3] });
+
+    // Reopening the same file must not wipe persisted artifact state.
+    await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    assert.deepEqual(await store.getArtifactState(session.key), { items: [1, 2, 3] });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact state operations no-op on an unknown session", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const store = new SessionStore(path.join(dir, "state.json"));
+    assert.equal(await store.getArtifactState("missing"), null);
+    assert.equal(await store.setArtifactState("missing", { a: 1 }), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("overlapping mutations are serialized so neither write is lost", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+
+    // Fire a debounced-style artifact state write and a prompt queue without awaiting in
+    // between: unserialized read-modify-write cycles would let the later write clobber the
+    // earlier one's field.
+    await Promise.all([
+      store.setArtifactState(session.key, { step: 3 }),
+      store.queuePrompts(session.key, {
+        domSnapshot: 'uid=1 h1 "Hello"',
+        prompts: [{ uid: "1", prompt: "Keep this", selector: "h1", tag: "h1", text: "Hello" }],
+      }),
+      store.setArtifactState(session.key, { step: 4 }),
+    ]);
+
+    assert.deepEqual(await store.getArtifactState(session.key), { step: 4 });
+    const feedback = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(feedback.prompts.length, 1);
+    assert.equal(feedback.prompts[0].prompt, "Keep this");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("state writes are atomic: no temp files linger and the file is always parseable", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await Promise.all(Array.from({ length: 20 }, (_, i) => store.setArtifactState(session.key, { seq: i })));
+
+    const entries = await readdir(dir);
+    assert.deepEqual(entries.sort(), ["artifact.html", "state.json"]);
+    JSON.parse(await readFile(stateFile, "utf8"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

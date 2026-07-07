@@ -2605,3 +2605,133 @@ test("extractArtifactHead reads the real href, not one hidden in another attribu
   );
   assert.equal(inValue.faviconTag, '<link rel="icon" href="https://cdn.example.com/logo.png">');
 });
+
+test("artifact state round-trips through the server", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const session = await (
+      await fetch(`${base}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: artifact }),
+      })
+    ).json();
+
+    const initial = await fetch(`${base}/api/${session.key}/state`);
+    assert.equal(initial.status, 200);
+    assert.equal(await initial.json(), null);
+
+    const write = await fetch(`${base}/api/${session.key}/state`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ checklist: [true, false] }),
+    });
+    assert.equal(write.status, 204);
+
+    const read = await fetch(`${base}/api/${session.key}/state`);
+    assert.deepEqual(await read.json(), { checklist: [true, false] });
+
+    for (const primitive of [0, "", false, "ready"]) {
+      const writePrimitive = await fetch(`${base}/api/${session.key}/state`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(primitive),
+      });
+      assert.equal(writePrimitive.status, 204);
+      const readPrimitive = await fetch(`${base}/api/${session.key}/state`);
+      assert.deepEqual(await readPrimitive.json(), primitive);
+    }
+
+    // Express non-strict routing also routes the trailing-slash path here; it must get the
+    // same lenient parser or primitive bodies fail on it.
+    const trailingSlash = await fetch(`${base}/api/${session.key}/state/`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify("ready"),
+    });
+    assert.equal(trailingSlash.status, 204);
+    assert.deepEqual(await (await fetch(`${base}/api/${session.key}/state`)).json(), "ready");
+
+    // An unparsed body (no JSON content-type) must not silently clear persisted state.
+    const unparsed = await fetch(`${base}/api/${session.key}/state`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: "whoops",
+    });
+    assert.equal(unparsed.status, 400);
+    assert.deepEqual(await (await fetch(`${base}/api/${session.key}/state`)).json(), "ready");
+
+    const clear = await fetch(`${base}/api/${session.key}/state`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(null),
+    });
+    assert.equal(clear.status, 204);
+    const cleared = await fetch(`${base}/api/${session.key}/state`);
+    assert.equal(cleared.status, 200);
+    assert.equal(await cleared.json(), null);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact state rejects unknown sessions and oversized payloads", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const session = await (
+      await fetch(`${base}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: artifact }),
+      })
+    ).json();
+
+    assert.equal((await fetch(`${base}/api/missingkey/state`)).status, 404);
+    assert.equal(
+      (
+        await fetch(`${base}/api/missingkey/state`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ a: 1 }),
+        })
+      ).status,
+      404,
+    );
+
+    const oversized = await fetch(`${base}/api/${session.key}/state`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ blob: "x".repeat(1024 * 1024 + 64) }),
+    });
+    assert.equal(oversized.status, 413);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact SDK exposes server-backed state helpers over the postMessage bridge", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /setState/);
+  assert.match(js, /getState/);
+  assert.match(js, /lavish:setState/);
+  assert.match(js, /lavish:getState/);
+  assert.match(js, /lavish:state/);
+});
+
+test("artifact iframe sandbox stays opaque so persisted state never relaxes isolation", () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+
+  assert.match(html, /sandbox="allow-scripts allow-forms allow-popups allow-downloads"/);
+  assert.doesNotMatch(html, /allow-same-origin/);
+});

@@ -569,6 +569,55 @@ export function createArtifactSdk(
     parent.postMessage({ type: "lavish:endSession" }, "*");
   }
 
+  // Server-backed key/value state so artifacts survive reloads. The iframe is sandboxed without
+  // allow-same-origin, so localStorage/IndexedDB throw here; the chrome relays these messages to
+  // a per-session server store. setState is fire-and-forget (the chrome debounces the write);
+  // getState resolves the last persisted value, or null on an older host that ignores the message.
+  let stateRequestCounter = 0;
+  const pendingStateRequests = new Map();
+
+  function setState(state) {
+    parent.postMessage({ type: "lavish:setState", state }, "*");
+  }
+
+  function getState() {
+    return new Promise((resolve) => {
+      // Opened standalone (no embedding chrome): there is no host to answer, so resolve
+      // immediately instead of waiting out the retry window.
+      if (window.parent === window) {
+        resolve(null);
+        return;
+      }
+      const id = "lavish-state-" + ++stateRequestCounter;
+      let settled = false;
+      /** @type {number | undefined} */
+      let retryTimer;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+        pendingStateRequests.delete(id);
+        resolve(value === undefined ? null : value);
+      };
+      pendingStateRequests.set(id, finish);
+      // A null resolution makes callers hydrate defaults, and their next setState would
+      // overwrite the real saved state - so retry a possibly-lost request a few times and
+      // only give up on a host that never answers (e.g. an older chrome ignoring getState).
+      let attempts = 0;
+      const request = () => {
+        if (settled) return;
+        attempts += 1;
+        if (attempts > 3) {
+          finish(null);
+          return;
+        }
+        parent.postMessage({ type: "lavish:getState", id }, "*");
+        retryTimer = window.setTimeout(request, attempts * 1000);
+      };
+      request();
+    });
+  }
+
   function snapshot() {
     const lines = [];
 
@@ -1037,6 +1086,8 @@ export function createArtifactSdk(
     queuePrompt,
     sendQueuedPrompts,
     endSession,
+    setState,
+    getState,
     getQueuedPrompts: () => [],
     setStatus: (message) => parent.postMessage({ type: "lavish:status", message: String(message) }, "*"),
     snapshot,
@@ -1050,6 +1101,11 @@ export function createArtifactSdk(
     }
     if (msg.type === "lavish:restoreScroll") {
       window.scrollTo(Number(msg.x) || 0, Number(msg.y) || 0);
+    }
+    // Only the embedding chrome may answer getState: any window can post into the iframe,
+    // and a spoofed reply would hydrate the artifact with attacker-chosen state.
+    if (msg.type === "lavish:state" && event.source === window.parent && pendingStateRequests.has(msg.id)) {
+      pendingStateRequests.get(msg.id)(msg.state ?? null);
     }
   });
 
